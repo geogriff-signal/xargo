@@ -113,6 +113,7 @@ version = "0.0.0"
                 writeln!(io::stderr(), "+ RUSTFLAGS={:?}", flags).ok();
             }
             cmd.env("RUSTFLAGS", flags);
+            cmd.env("RUSTC_BOOTSTRAP", "1");
             cmd.env_remove("CARGO_TARGET_DIR");
 
             // As of rust-lang/cargo#4788 Cargo invokes rustc with a changed "current directory" so

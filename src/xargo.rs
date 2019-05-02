@@ -3,7 +3,7 @@ use std::process::{Command, ExitStatus};
 use std::{env, mem};
 use std::io::{self, Write};
 
-use toml::Value;
+use toml::{Table, Value};
 use rustc_version::VersionMeta;
 
 use CompilationMode;
@@ -122,5 +122,38 @@ pub fn toml(root: &Root) -> Result<Option<Toml>> {
         util::parse(&p).map(|t| Some(Toml { table: t }))
     } else {
         Ok(None)
+    }
+}
+
+pub struct Lockfile {
+    table: Value,
+}
+
+impl Lockfile {
+    pub fn new(stages: Table) -> Self {
+        let mut table = Table::new();
+        table.insert("stages".to_string(), Value::Table(stages));
+
+        Self {
+            table: Value::Table(table),
+        }
+    }
+    pub fn stages(&self) -> Option<&Value> {
+        self.table.lookup("stages")
+    }
+    pub fn write(&self, root: &Root) -> Result<()> {
+        let p = root.path().join("Xargo.lock");
+
+        util::write(&p, &self.table.to_string())
+    }
+}
+
+pub fn lockfile(root: &Root) -> Result<Option<Lockfile>> {
+    let p = root.path().join("Xargo.lock");
+
+    if p.exists() {
+        util::parse(&p).map(|t| Some(Lockfile { table: t }))
+    } else {
+        Ok(Default::default())
     }
 }

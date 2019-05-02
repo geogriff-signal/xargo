@@ -38,7 +38,7 @@ fn build(
     sysroot: &Sysroot,
     hash: u64,
     verbose: bool,
-) -> Result<()> {
+) -> Result<xargo::Lockfile> {
     const TOML: &'static str = r#"
 [package]
 authors = ["The Rust Project Developers"]
@@ -75,7 +75,9 @@ version = "0.0.0"
         }
     }
 
-    for (_, stage) in blueprint.stages {
+    let mut new_lockfile_stages = Table::new();
+
+    for (stage_num, stage) in blueprint.stages {
         let td = TempDir::new("xargo").chain_err(|| "couldn't create a temporary directory")?;
         let tdp;
         let td = if env::var_os("XARGO_KEEP_TEMP").is_some() {
@@ -102,6 +104,9 @@ version = "0.0.0"
         }
 
         util::write(&td.join("Cargo.toml"), &stoml)?;
+        if let Some(lockfile) = stage.lockfile {
+            util::write(&td.join("Cargo.lock"), &lockfile.to_string())?;
+        }
         util::mkdir(&td.join("src"))?;
         util::write(&td.join("src/lib.rs"), "")?;
 
@@ -156,6 +161,9 @@ version = "0.0.0"
             cargo().arg("-p").arg(krate).run(verbose)?;
         }
 
+        let new_lockfile_stage = util::parse(&td.join("Cargo.lock"))?;
+        new_lockfile_stages.insert(stage_num.to_string(), new_lockfile_stage);
+
         // Copy artifacts to Xargo sysroot
         util::cp_r(
             &td.join("target")
@@ -166,10 +174,13 @@ version = "0.0.0"
         )?;
     }
 
+
+    let new_lockfile = xargo::Lockfile::new(new_lockfile_stages);
+
     // Create hash file
     util::write(&rustlib.parent().join(".hash"), &hash.to_string())?;
 
-    Ok(())
+    Ok(new_lockfile)
 }
 
 fn old_hash(cmode: &CompilationMode, home: &Home) -> Result<Option<u64>> {
@@ -231,13 +242,14 @@ pub fn update(
 ) -> Result<()> {
     let ctoml = cargo::toml(root)?;
     let xtoml = xargo::toml(root)?;
+    let xlock = xargo::lockfile(root)?;
 
-    let blueprint = Blueprint::from(xtoml.as_ref(), cmode.triple(), root, &src)?;
+    let blueprint = Blueprint::from(xtoml.as_ref(), xlock.as_ref(), cmode.triple(), root, &src)?;
 
     let hash = hash(cmode, &blueprint, rustflags, &ctoml, meta)?;
 
     if old_hash(cmode, home)? != Some(hash) {
-        build(
+        let new_xlock = build(
             cmode,
             blueprint,
             &ctoml,
@@ -247,6 +259,8 @@ pub fn update(
             hash,
             verbose,
         )?;
+
+        new_xlock.write(root)?;
     }
 
     // copy host artifacts into the sysroot, if necessary
@@ -298,6 +312,7 @@ pub fn update(
 pub struct Stage {
     crates: Vec<String>,
     dependencies: Table,
+    lockfile: Option<Value>,
     patch: Option<Table>,
 }
 
@@ -314,7 +329,7 @@ impl Blueprint {
         }
     }
 
-    fn from(toml: Option<&xargo::Toml>, target: &str, root: &Root, src: &Src) -> Result<Self> {
+    fn from(toml: Option<&xargo::Toml>, lockfile: Option<&xargo::Lockfile>, target: &str, root: &Root, src: &Src) -> Result<Self> {
         let deps = match (
             toml.and_then(|t| t.dependencies()),
             toml.and_then(|t| t.target_dependencies(target)),
@@ -375,6 +390,12 @@ impl Blueprint {
             }
         };
 
+        let lockfile_stages = if let Some(lockfile_stages_value) = lockfile.and_then(|t| t.stages()) {
+            Some(lockfile_stages_value.as_table().ok_or_else(|| format!("Xargo.lock stages must be an table"))?)
+        } else {
+            None
+        };
+
         let mut blueprint = Blueprint::new();
         for (k, v) in deps {
             if let Value::Table(mut map) = v {
@@ -410,7 +431,9 @@ impl Blueprint {
                     }
                 }
 
-                blueprint.push(stage, k, map, src);
+                let lockfile_stage = lockfile_stages.and_then(|t| t.get(&stage.to_string()));
+
+                blueprint.push(stage, k, map, lockfile_stage, src);
             } else {
                 Err(format!(
                     "Xargo.toml: target.{}.dependencies.{} must be \
@@ -423,10 +446,11 @@ impl Blueprint {
         Ok(blueprint)
     }
 
-    fn push(&mut self, stage: i64, krate: String, toml: Table, src: &Src) {
+    fn push(&mut self, stage: i64, krate: String, toml: Table, lockfile: Option<&Value>, src: &Src) {
         let stage = self.stages.entry(stage).or_insert_with(|| Stage {
             crates: vec![],
             dependencies: Table::new(),
+            lockfile: lockfile.cloned(),
             patch: {
                 let rustc_std_workspace_core = src.path().join("tools/rustc-std-workspace-core");
                 if rustc_std_workspace_core.exists() {

@@ -90,6 +90,7 @@ version = "0.0.0"
             let mut map = Table::new();
 
             map.insert("dependencies".to_owned(), Value::Table(stage.dependencies));
+            map.insert("build-dependencies".to_owned(), Value::Table(stage.build_dependencies));
             if let Some(patch) = stage.patch {
                 map.insert("patch".to_owned(), Value::Table(patch));
             }
@@ -298,6 +299,7 @@ pub fn update(
 pub struct Stage {
     crates: Vec<String>,
     dependencies: Table,
+    build_dependencies: Table,
     patch: Option<Table>,
 }
 
@@ -315,68 +317,77 @@ impl Blueprint {
     }
 
     fn from(toml: Option<&xargo::Toml>, target: &str, root: &Root, src: &Src) -> Result<Self> {
-        let deps = match (
-            toml.and_then(|t| t.dependencies()),
-            toml.and_then(|t| t.target_dependencies(target)),
-        ) {
-            (Some(value), Some(tvalue)) => {
-                let mut deps = value
-                    .as_table()
-                    .cloned()
-                    .ok_or_else(|| format!("Xargo.toml: `dependencies` must be a table"))?;
+        let calculate_deps = |dependencies: Option<&toml::Value>, target_dependencies: Option<&toml::Value>| -> Result<_> {
+            match (dependencies, target_dependencies) {
+                (Some(value), Some(tvalue)) => {
+                    let mut deps = value
+                        .as_table()
+                        .cloned()
+                        .ok_or_else(|| format!("Xargo.toml: `dependencies` must be a table"))?;
 
-                let more_deps = tvalue.as_table().ok_or_else(|| {
-                    format!(
-                        "Xargo.toml: `target.{}.dependencies` must be \
+                    let more_deps = tvalue.as_table().ok_or_else(|| {
+                        format!(
+                            "Xargo.toml: `target.{}.dependencies` must be \
+                             a table",
+                            target
+                        )
+                    })?;
+                    for (k, v) in more_deps {
+                        if deps.insert(k.to_owned(), v.clone()).is_some() {
+                            Err(format!(
+                                "found duplicate dependency name {}, \
+                                 but all dependencies must have a \
+                                 unique name",
+                                k
+                            ))?
+                        }
+                    }
+
+                    Ok(deps)
+                }
+                (Some(value), None) | (None, Some(value)) => if let Some(table) = value.as_table() {
+                    Ok(table.clone())
+                } else {
+                    Err(format!(
+                        "Xargo.toml: target.{}.dependencies must be \
                          a table",
                         target
-                    )
-                })?;
-                for (k, v) in more_deps {
-                    if deps.insert(k.to_owned(), v.clone()).is_some() {
-                        Err(format!(
-                            "found duplicate dependency name {}, \
-                             but all dependencies must have a \
-                             unique name",
-                            k
-                        ))?
-                    }
+                    ))?
+                },
+                (None, None) => {
+                    // If no dependencies were listed, we assume `core` and `compiler_builtins` as the
+                    // dependencies
+                    let mut t = BTreeMap::new();
+                    let mut core = BTreeMap::new();
+                    core.insert("stage".to_owned(), Value::Integer(0));
+                    t.insert("core".to_owned(), Value::Table(core));
+                    let mut cb = BTreeMap::new();
+                    cb.insert(
+                        "features".to_owned(),
+                        Value::Array(vec![Value::String("mem".to_owned())]),
+                    );
+                    cb.insert("stage".to_owned(), Value::Integer(1));
+                    t.insert(
+                        "compiler_builtins".to_owned(),
+                        Value::Table(cb),
+                    );
+                    Ok(t)
                 }
-
-                deps
-            }
-            (Some(value), None) | (None, Some(value)) => if let Some(table) = value.as_table() {
-                table.clone()
-            } else {
-                Err(format!(
-                    "Xargo.toml: target.{}.dependencies must be \
-                     a table",
-                    target
-                ))?
-            },
-            (None, None) => {
-                // If no dependencies were listed, we assume `core` and `compiler_builtins` as the
-                // dependencies
-                let mut t = BTreeMap::new();
-                let mut core = BTreeMap::new();
-                core.insert("stage".to_owned(), Value::Integer(0));
-                t.insert("core".to_owned(), Value::Table(core));
-                let mut cb = BTreeMap::new();
-                cb.insert(
-                    "features".to_owned(),
-                    Value::Array(vec![Value::String("mem".to_owned())]),
-                );
-                cb.insert("stage".to_owned(), Value::Integer(1));
-                t.insert(
-                    "compiler_builtins".to_owned(),
-                    Value::Table(cb),
-                );
-                t
             }
         };
 
+        let deps = calculate_deps(
+            toml.and_then(|t| t.dependencies()),
+            toml.and_then(|t| t.target_dependencies(target)),
+        )?;
+
+        let build_deps = calculate_deps(
+            toml.and_then(|t| t.build_dependencies()),
+            None
+        )?;
+
         let mut blueprint = Blueprint::new();
-        for (k, v) in deps {
+        let add_dep = |build_dependency: bool| move |mut blueprint: Blueprint, (k,v): (String, toml::Value)| -> Result<Blueprint> {
             if let Value::Table(mut map) = v {
                 let stage = if let Some(value) = map.remove("stage") {
                     value
@@ -410,7 +421,7 @@ impl Blueprint {
                     }
                 }
 
-                blueprint.push(stage, k, map, src);
+                blueprint.push(stage, k, map, src, build_dependency);
             } else {
                 Err(format!(
                     "Xargo.toml: target.{}.dependencies.{} must be \
@@ -418,15 +429,19 @@ impl Blueprint {
                     target, k
                 ))?
             }
-        }
+            Ok(blueprint)
+        };
+        blueprint = deps.into_iter().try_fold(blueprint, add_dep(false))?;
+        blueprint = build_deps.into_iter().try_fold(blueprint, add_dep(true))?;
 
         Ok(blueprint)
     }
 
-    fn push(&mut self, stage: i64, krate: String, toml: Table, src: &Src) {
+    fn push(&mut self, stage: i64, krate: String, toml: Table, src: &Src, build_dependency: bool) {
         let stage = self.stages.entry(stage).or_insert_with(|| Stage {
             crates: vec![],
             dependencies: Table::new(),
+            build_dependencies: Table::new(),
             patch: {
                 let rustc_std_workspace_core = src.path().join("tools/rustc-std-workspace-core");
                 if rustc_std_workspace_core.exists() {
@@ -450,7 +465,11 @@ impl Blueprint {
             }
         });
 
-        stage.dependencies.insert(krate.clone(), Value::Table(toml));
+        if build_dependency {
+            stage.build_dependencies.insert(krate.clone(), Value::Table(toml));
+        } else {
+            stage.dependencies.insert(krate.clone(), Value::Table(toml));
+        }
         stage.crates.push(krate);
     }
 

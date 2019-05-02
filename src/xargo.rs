@@ -108,6 +108,11 @@ impl Toml {
         self.table.lookup("dependencies")
     }
 
+    /// Returns the `dependencies` part of `Xargo.toml`
+    pub fn build_dependencies(&self) -> Option<&Value> {
+        self.table.lookup("build-dependencies")
+    }
+
     /// Returns the `target.{}.dependencies` part of `Xargo.toml`
     pub fn target_dependencies(&self, target: &str) -> Option<&Value> {
         self.table
